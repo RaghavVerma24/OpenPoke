@@ -1,11 +1,17 @@
 """Simple agent roster management - just a list of agent names."""
 
 import json
-import fcntl
+import os
 import time
 from pathlib import Path
 
 from ...logging_config import logger
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 
 class AgentRoster:
@@ -40,14 +46,29 @@ class AgentRoster:
             try:
                 self._roster_path.parent.mkdir(parents=True, exist_ok=True)
 
-                # Open file and acquire exclusive lock
-                with open(self._roster_path, 'w') as f:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Open without truncating so the existing data remains intact until locked.
+                self._roster_path.touch(exist_ok=True)
+                with open(self._roster_path, 'r+', encoding='utf-8') as f:
+                    if fcntl is not None:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        f.seek(0, os.SEEK_END)
+                        if f.tell() == 0:
+                            f.write(' ')
+                            f.flush()
+                        f.seek(0)
+                        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
                     try:
+                        f.seek(0)
+                        f.truncate()
                         json.dump(self._agents, f, indent=2)
                         return
                     finally:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        if fcntl is not None:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        else:
+                            f.seek(0)
+                            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 
             except BlockingIOError:
                 # Lock is held by another process
@@ -56,6 +77,12 @@ class AgentRoster:
                     retry_delay *= 2  # Exponential backoff
                 else:
                     logger.warning("Failed to acquire lock on roster.json after retries")
+            except OSError as exc:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logger.warning(f"Failed to acquire lock on roster.json after retries: {exc}")
             except Exception as exc:
                 logger.warning(f"Failed to save roster.json: {exc}")
                 break

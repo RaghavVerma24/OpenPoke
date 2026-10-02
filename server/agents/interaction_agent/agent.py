@@ -4,7 +4,8 @@ from html import escape
 from pathlib import Path
 from typing import Dict, List
 
-from ...services.execution import get_agent_roster
+from ...services.execution import get_agent_roster, get_execution_agent_logs
+from ...services.execution.router import AgentRouter, profiles_from_roster
 
 _prompt_path = Path(__file__).parent / "system_prompt.md"
 SYSTEM_PROMPT = _prompt_path.read_text(encoding="utf-8").strip()
@@ -26,7 +27,7 @@ def prepare_message_with_history(
     sections: List[str] = []
 
     sections.append(_render_conversation_history(transcript))
-    sections.append(f"<active_agents>\n{_render_active_agents()}\n</active_agents>")
+    sections.append(f"<active_agents>\n{_render_active_agents(latest_text)}\n</active_agents>")
     sections.append(_render_current_turn(latest_text, message_type))
 
     content = "\n\n".join(sections)
@@ -42,7 +43,7 @@ def _render_conversation_history(transcript: str) -> str:
 
 
 # Format currently active execution agents into XML tags for LLM awareness
-def _render_active_agents() -> str:
+def _render_active_agents(query: str) -> str:
     roster = get_agent_roster()
     roster.load()
     agents = roster.get_agents()
@@ -50,10 +51,24 @@ def _render_active_agents() -> str:
     if not agents:
         return "None"
 
+    # Read a compact request summary per agent and expose only a fixed-size candidate set.
+    import os
+    try:
+        top_k = min(5, max(1, int(os.getenv("OPENPOKE_AGENT_ROUTER_TOP_K", "4"))))
+        threshold = min(1.0, max(0.0, float(os.getenv("OPENPOKE_AGENT_ROUTER_THRESHOLD", "0.29"))))
+    except ValueError:
+        top_k, threshold = 4, 0.29
+    candidates = AgentRouter(top_k=top_k, threshold=threshold).route(
+        query, profiles_from_roster(agents, get_execution_agent_logs())
+    ).candidates
+    if not candidates:
+        return "No existing agent appears relevant. Create a new agent for a genuinely new task; do not reuse an unrelated one."
+
     rendered: List[str] = []
-    for agent_name in agents:
-        name = escape(agent_name or "agent", quote=True)
-        rendered.append(f'<agent name="{name}" />')
+    for profile in candidates:
+        name = escape(profile.name or "agent", quote=True)
+        description = escape(profile.description[:240], quote=True)
+        rendered.append(f'<agent name="{name}" description="{description}" />')
 
     return "\n".join(rendered)
 

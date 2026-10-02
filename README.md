@@ -78,5 +78,42 @@ The web app proxies API calls to the Python server using the values in `.env`, s
 - `web/` – Next.js app
 - `server/data/` – runtime data (ignored by git)
 
+## Agent routing
+
+The Interaction Agent previously received every execution-agent name on every turn. As that roster grows, the model has more context to inspect and more chances to reuse an unrelated agent.
+
+OpenPoke now ranks existing agents before building the Interaction Agent message. The deterministic router searches the agent name and a short summary derived from up to eight recent log entries (only the latest request is retained in the searchable profile). It uses lexical overlap plus a small synonym map and named-entity overlap. It returns at most four candidates by default, and abstains when the best score is below `0.29`. With no match, the Interaction Agent is told to create a new agent for a new task rather than forcing reuse.
+
+Set `OPENPOKE_AGENT_ROUTER_TOP_K` to choose a candidate limit from 1 to 5 and `OPENPOKE_AGENT_ROUTER_THRESHOLD` to tune confidence from 0 to 1. Defaults are 4 and 0.29. No external package or vector database is required.
+
+### Tests and evaluation
+
+Run the router and message-context tests, plus the evaluator, from the repository root:
+
+```powershell
+python -m unittest discover -s server/tests -p "test*.py"
+python server/tests/evaluate_router.py
+```
+
+The evaluator includes 40 labeled queries across exact and paraphrased matches, entity and topic collisions, and unrelated requests. It compares candidate exposure with the existing full-roster behavior, which exposes all 10 fixture agents for each query. The current results are:
+
+| Measure | Result |
+| --- | ---: |
+| Recall@1 / Recall@3 | 93.8% / 93.8% |
+| MRR | 0.938 |
+| False reuse rate on no-match queries | 0% |
+| No-match accuracy | 100% |
+| Mean agents exposed (baseline: 10) | 1.90 |
+| Agent-count exposure reduction | 81.0% |
+| Estimated context-word reduction | 20.0% |
+
+The evaluator also pads the same fixture to 10, 50, 100, and 500 agents. It exposed a mean of 1.90, 1.95, 1.95, and 1.95 candidates respectively, with a hard maximum of four. The synthetic scale run measures bounded exposure and is not a latency benchmark. Context-word reduction is an estimate from names and compact summaries, not a tokenizer measurement.
+
+There is no pre-existing automated server test suite in this checkout. The router unit tests and evaluator use only Python's standard library; the message-context integration tests use the app's installed backend dependencies. All tests are deterministic. Live model and Gmail flows still need valid API credentials.
+
+### Tradeoffs and next steps
+
+This baseline favors low cost, explainability, and safe abstention over broad semantic recall. It can miss paraphrases that share no vocabulary with an agent's name or recent request, and its synonym/entity rules are intentionally small. A production version could add vector retrieval, a learned reranker, richer entity extraction, and recent-agent caching after measuring those needs. Agent lifecycle management remains outside this change.
+
 ## License
 MIT — see [LICENSE](LICENSE).
