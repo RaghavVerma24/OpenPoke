@@ -2,10 +2,198 @@
 
 OpenPoke is a simplified, open-source take on [Interaction Company’s](https://interaction.co/about) [Poke](https://poke.com/) assistant—built to show how a multi-agent orchestration stack can feel genuinely useful. It keeps the handful of things Poke is great at (email triage, reminders, and persistent agents) while staying easy to spin up locally.
 
+## Project overview
 - Multi-agent FastAPI backend that mirrors Poke's interaction/execution split, powered by [OpenRouter](https://openrouter.ai/).
 - Gmail tooling via [Composio](https://composio.dev/) for drafting/replying/forwarding without leaving chat.
 - Trigger scheduler and background watchers for reminders and "important email" alerts.
 - Next.js web UI that proxies everything through the shared `.env`, so plugging in API keys is the only setup.
+
+## Take-home: reducing agent overload
+
+**Problem:** As persistent agents accumulate, asking the Interaction Agent to
+consider the whole roster makes its decision context grow with the agent count.
+
+**Change:** Add a deterministic retrieval step that ranks compact agent
+profiles before the Interaction Agent runs. The current router returns at most
+four candidates and abstains below its confidence threshold; the Interaction
+Agent still makes the final choice.
+
+```text
+Original: user request -> Interaction Agent + all N agent profiles -> chosen agent
+New:      user request -> router -> at most K profiles
+          -> Interaction Agent -> chosen agent
+```
+
+**Measured on the fixed 40-query, 10-agent evaluation:** Recall@1/3 93.8%,
+no-match accuracy 100%, false reuse 0%, and mean downstream exposure 1.90 vs.
+10 agents (81% fewer). These are deterministic router metrics, not live LLM
+answer-quality results. The scale check measures bounded exposure; retrieval
+itself remains a linear scan, as discussed below.
+
+## Demo: three validation flows
+
+Use these three paired flows to walk through the same types of requests in
+the original architecture and with the router. They are based on
+the deterministic 10-agent evaluation fixture. Run it from the repository
+root with:
+
+```powershell
+python server/tests/evaluate_router.py
+```
+
+The candidate scores shown are actual outputs for these sample requests.
+They are relative ranking signals, not calibrated probabilities. The
+original-flow path is conceptual: the evaluator does not call an LLM to
+measure old-flow answer accuracy. The distinction is not whether profiles are
+compact: the original Interaction Agent could receive compact profiles too,
+but it still receives all N of them; the router limits what reaches it to K.
+
+### 1. Clear match: Alice's email
+
+Request: **“Did Alice ever respond about lunch?”** The fixture includes
+`Alice Email`, `Alice Calendar`, and other unrelated agents.
+
+```text
+ORIGINAL
+User request
+    |
+    v
+Interaction Agent sees all 10 agents
+    |
+    v
+Chooses Alice Email
+
+ROUTER APPROACH
+User request
+    |
+    v
+Router ranks compact profiles
+    |
+    +-- Alice Email       0.697 (rank 1)
+    +-- Alice Calendar    0.528
+    +-- Mom Email         0.275
+    |
+    v
+Interaction Agent sees shortlist
+    |
+    v
+Alice Email execution agent
+```
+
+**Demo point:** Both approaches can reach the correct agent. The new flow
+makes retrieval an explicit step and gives the Interaction Agent a shortlist.
+On the full 40-query evaluation, Recall@1 and Recall@3 are both 93.8% (MRR
+0.938). Recall@K means the expected agent is present in the first K results;
+it does not mean the agent completed the task correctly.
+
+### 2. Entity and task collision: email versus calendar
+
+Request: **“Schedule a meeting with Alice.”** Two persistent agents relate to
+Alice, but only one handles scheduling.
+
+```text
+ORIGINAL
+User request
+    |
+    v
+Interaction Agent sees all 10 agents
+    |
+    v
+Must distinguish Alice Email from Alice Calendar
+    |
+    v
+Chooses Alice Calendar
+
+ROUTER APPROACH
+User request
+    |
+    v
+Router scores entity + task terms
+    |
+    +-- Alice Calendar    0.807 (rank 1)
+    +-- Alice Email       0.623
+    |
+    v
+Interaction Agent sees shortlist
+    |
+    v
+Alice Calendar execution agent
+```
+
+**Demo point:** The shared entity alone is not enough; task vocabulary helps
+rank Calendar ahead of Email. The router narrows the options, while the
+Interaction Agent remains responsible for the final choice.
+
+### 3. No suitable agent: abstain
+
+Request: **“Find a plumber near me.”** There is no plumbing agent in the
+fixture.
+
+```text
+ORIGINAL
+User request
+    |
+    v
+Interaction Agent sees all 10 agents
+    |
+    v
+Must decide whether to reuse or create
+
+ROUTER APPROACH
+User request
+    |
+    v
+Router: no profile reaches threshold 0.29
+    |
+    v
+Returns no candidates
+    |
+    v
+Interaction Agent sees no reusable match
+    |
+    v
+Create an agent or clarify the request
+```
+
+**Demo point:** The threshold gives the router an explicit abstention path,
+instead of always returning the least-wrong existing agent. On the evaluator's
+no-match examples, no-match accuracy is 100% and false reuse is 0%. These are
+router metrics; the evaluator does not prove that a live Interaction Agent
+will always create the right new agent.
+
+### What happens as the roster grows? Where does an index fit?
+
+The current scale check pads the fixture with unrelated agents and records
+profiles exposed to downstream reasoning:
+
+| Roster size | Original: all profiles | Router: mean candidates | Router: maximum |
+| ---: | ---: | ---: | ---: |
+| 10 | 10 | 1.90 | 4 |
+| 50 | 50 | 1.95 | 4 |
+| 100 | 100 | 1.95 | 4 |
+| 500 | 500 | 1.95 | 4 |
+
+On the 10-agent fixture this is 81% fewer agent candidates passed downstream;
+estimated context-word reduction is 20%. The word estimate uses names and
+compact summaries, not a tokenizer. This scale test uses synthetic distractors
+and measures exposure, not latency or recall on a newly labeled 500-agent set.
+
+Be clear about two different kinds of scaling. The router bounds the
+Interaction Agent's context to at most K candidates (K defaults to 4), but the
+prototype still scores every profile, so its retrieval computation is O(N).
+It does not currently use an index or claim lower retrieval latency.
+
+For production, profiles could be indexed when agents are created or updated.
+A lexical inverted index maps terms to profiles; a vector approximate
+nearest-neighbor (ANN) index can find semantically similar profiles. The query
+would retrieve a candidate pool, optionally rerank it, then pass the final
+Top-K to the Interaction Agent. An index trades memory and profile-update
+work for query-time search savings. It is not automatically O(log N): exact
+nearest-neighbor search can remain O(N), and ANN performance depends on the
+index, data, and configuration. I would add one only after measuring
+retrieval latency at realistic roster sizes, and evaluate Recall@K, abstention,
+freshness, and latency together.
+
 
 ## Requirements
 - Python 3.10+
@@ -110,6 +298,36 @@ The evaluator includes 40 labeled queries across exact and paraphrased matches, 
 The evaluator also pads the same fixture to 10, 50, 100, and 500 agents. It exposed a mean of 1.90, 1.95, 1.95, and 1.95 candidates respectively, with a hard maximum of four. The synthetic scale run measures bounded exposure and is not a latency benchmark. Context-word reduction is an estimate from names and compact summaries, not a tokenizer measurement.
 
 There is no pre-existing automated server test suite in this checkout. The router unit tests and evaluator use only Python's standard library; the message-context integration tests use the app's installed backend dependencies. All tests are deterministic. Live model and Gmail flows still need valid API credentials.
+
+### Local smoke test (Windows PowerShell)
+
+Run these commands from the repository root with the Python virtual environment activated. If using the `.venv-openpoke` environment created for this Windows setup, replace `python` with `.\.venv-openpoke\Scripts\python.exe`.
+
+1. Run automated checks:
+   ```powershell
+   python -m unittest discover -s server\tests -p "test*.py"
+   python server\tests\evaluate_router.py
+   ```
+2. Start the backend in one terminal:
+   ```powershell
+   python -m server.server --reload
+   ```
+3. In a second terminal, start the frontend:
+   ```powershell
+   npm run dev --prefix web
+   ```
+   If npm is unavailable but `web\node_modules` is already installed, start Next from its project directory:
+   ```powershell
+   Set-Location web
+   .\node_modules\.bin\next.cmd dev --hostname 127.0.0.1 --port 3000
+   ```
+4. Check the backend health endpoint and open the chat UI:
+   ```powershell
+   Invoke-RestMethod http://127.0.0.1:8001/api/v1/health
+   Start-Process http://localhost:3000
+   ```
+
+The health endpoint should return `ok: true`; the chat page should load. The automated tests exercise ranking, confidence abstention, top-K limits, and the exact agent context sent to the Interaction Agent without making a paid model call.
 
 ### Tradeoffs and next steps
 
